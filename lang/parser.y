@@ -63,6 +63,9 @@ func init() {
 	structFields []*ExprStructField
 	structField  *ExprStructField
 
+	args []*Arg
+	arg  *Arg
+
 	resContents []StmtResContents // interface
 	resField    *StmtResField
 	resEdge     *StmtResEdge
@@ -80,8 +83,9 @@ func init() {
 %token COMMA COLON SEMICOLON
 %token ELVIS ROCKET ARROW DOT
 %token STR_IDENTIFIER BOOL_IDENTIFIER INT_IDENTIFIER FLOAT_IDENTIFIER
-%token STRUCT_IDENTIFIER VARIANT_IDENTIFIER VAR_IDENTIFIER IDENTIFIER
-%token VAR_IDENTIFIER_HX CAPITALIZED_IDENTIFIER
+%token STRUCT_IDENTIFIER VAR_IDENTIFIER VAR_IDENTIFIER_HX FUNC_IDENTIFIER
+%token CLASS_IDENTIFIER INCLUDE_IDENTIFIER
+%token VARIANT_IDENTIFIER CAPITALIZED_IDENTIFIER IDENTIFIER
 %token COMMENT ERROR
 
 // precedence table
@@ -185,6 +189,96 @@ stmt:
 			ElseBranch: $8.stmt,
 		}
 	}
+	// `func name() { <expr> }`
+	// `func name(<arg>) { <expr> }`
+	// `func name(<arg>, <arg>) { <expr> }`
+|	FUNC_IDENTIFIER IDENTIFIER OPEN_PAREN args CLOSE_PAREN OPEN_CURLY expr CLOSE_CURLY
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.stmt = &StmtFunc{
+			Name: $2.str,
+			Func: &ExprFunc{
+				Args: $4.args,
+				//Return: nil,
+				Body: $7.expr,
+			},
+		}
+	}
+	// `func name(...) <type> { <expr> }`
+	| FUNC_IDENTIFIER IDENTIFIER OPEN_PAREN args CLOSE_PAREN type OPEN_CURLY expr CLOSE_CURLY
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.stmt = &StmtFunc{
+			Name: $2.str,
+			Func: &ExprFunc{
+				Args:   $4.args,
+				Return: $6.typ, // return type is known
+				Body:   $8.expr,
+			},
+		}
+		isFullyTyped := $6.typ != nil // true if set
+		m := make(map[string]*types.Type)
+		ord := []string{}
+		for _, a := range $4.args {
+			if a.Type == nil {
+				// at least one is unknown, can't run SetType...
+				isFullyTyped = false
+				break
+			}
+			m[a.Name] = a.Type
+			ord = append(ord, a.Name)
+		}
+		if isFullyTyped {
+			typ := &types.Type{
+				Kind: types.KindFunc,
+				Map:  m,
+				Ord:  ord,
+				Out:  $6.typ,
+			}
+			if err := $$.stmt.Func.SetType(typ); err != nil {
+				// this will ultimately cause a parser error to occur...
+				yylex.Error(fmt.Sprintf("%s: %+v", ErrParseSetType, err))
+			}
+		}
+	}
+	// `class name { <prog> }`
+|	CLASS_IDENTIFIER IDENTIFIER OPEN_CURLY prog CLOSE_CURLY
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.stmt = &StmtClass{
+			Name: $2.str,
+			Args: nil,
+			Body: $4.stmt,
+		}
+	}
+	// `class name(<arg>) { <prog> }`
+	// `class name(<arg>, <arg>) { <prog> }`
+|	CLASS_IDENTIFIER IDENTIFIER OPEN_PAREN args CLOSE_PAREN OPEN_CURLY prog CLOSE_CURLY
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.stmt = &StmtClass{
+			Name: $2.str,
+			Args: $4.args,
+			Body: $7.stmt,
+		}
+	}
+	// `include name`
+|	INCLUDE_IDENTIFIER IDENTIFIER
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.stmt = &StmtInclude{
+			Name: $2.str,
+		}
+	}
+	// `include name(...)`
+|	INCLUDE_IDENTIFIER IDENTIFIER OPEN_PAREN call_args CLOSE_PAREN
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.stmt = &StmtInclude{
+			Name: $2.str,
+			Args: $4.exprs,
+		}
+	}
 /*
 	// resource bind
 |	rbind
@@ -248,6 +342,12 @@ expr:
 		$$.expr = $1.expr
 	}
 |	var
+	{
+		posLast(yylex, yyDollar) // our pos
+		// TODO: var could be squashed in here directly...
+		$$.expr = $1.expr
+	}
+|	func
 	{
 		posLast(yylex, yyDollar) // our pos
 		// TODO: var could be squashed in here directly...
@@ -369,6 +469,17 @@ call:
 		$$.expr = &ExprCall{
 			Name: $1.str,
 			Args: $3.exprs,
+			//Var: false, // default
+		}
+	}
+	// `$foo(4, "hey")` # call function value
+|	VAR_IDENTIFIER OPEN_PAREN call_args CLOSE_PAREN
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.expr = &ExprCall{
+			Name: $1.str,
+			Args: $3.exprs,
+			Var: true, // lambda
 		}
 	}
 |	expr PLUS expr
@@ -596,6 +707,7 @@ call:
 	}
 ;
 // list order gets us the position of the arg, but named params would work too!
+// this is also used by the include statement when the called class uses args!
 call_args:
 	/* end of list */
 	{
@@ -620,6 +732,88 @@ var:
 		posLast(yylex, yyDollar) // our pos
 		$$.expr = &ExprVar{
 			Name: $1.str,
+		}
+	}
+;
+func:
+	// `func() { <expr> }`
+	// `func(<arg>) { <expr> }`
+	// `func(<arg>, <arg>) { <expr> }`
+	FUNC_IDENTIFIER OPEN_PAREN args CLOSE_PAREN OPEN_CURLY expr CLOSE_CURLY
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.expr = &ExprFunc{
+			Args: $3.args,
+			//Return: nil,
+			Body: $6.expr,
+		}
+	}
+	// `func(...) <type> { <expr> }`
+	| FUNC_IDENTIFIER OPEN_PAREN args CLOSE_PAREN type OPEN_CURLY expr CLOSE_CURLY
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.expr = &ExprFunc{
+			Args:   $3.args,
+			Return: $5.typ, // return type is known
+			Body:   $7.expr,
+		}
+		isFullyTyped := $5.typ != nil // true if set
+		m := make(map[string]*types.Type)
+		ord := []string{}
+		for _, a := range $3.args {
+			if a.Type == nil {
+				// at least one is unknown, can't run SetType...
+				isFullyTyped = false
+				break
+			}
+			m[a.Name] = a.Type
+			ord = append(ord, a.Name)
+		}
+		if isFullyTyped {
+			typ := &types.Type{
+				Kind: types.KindFunc,
+				Map:  m,
+				Ord:  ord,
+				Out:  $5.typ,
+			}
+			if err := $$.expr.SetType(typ); err != nil {
+				// this will ultimately cause a parser error to occur...
+				yylex.Error(fmt.Sprintf("%s: %+v", ErrParseSetType, err))
+			}
+		}
+	}
+;
+args:
+	/* end of list */
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.args = []*Arg{}
+	}
+|	args COMMA arg
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.args = append($1.args, $3.arg)
+	}
+|	arg
+	{
+		posLast(yylex, yyDollar) // our pos
+		$$.args = append([]*Arg{}, $1.arg)
+	}
+;
+arg:
+	// `$x`
+	VAR_IDENTIFIER
+	{
+		$$.arg = &Arg{
+			Name: $1.str,
+		}
+	}
+	// `$x <type>`
+	| VAR_IDENTIFIER type
+	{
+		$$.arg = &Arg{
+			Name: $1.str,
+			Type: $2.typ,
 		}
 	}
 ;
